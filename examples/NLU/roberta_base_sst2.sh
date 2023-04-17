@@ -1,7 +1,39 @@
-export num_gpus=8
+export num_gpus=1
 export CUBLAS_WORKSPACE_CONFIG=":16:8" # https://docs.nvidia.com/cuda/cublas/index.html#cublasApi_reproducibility
 export PYTHONHASHSEED=0
-export output_dir="./sst2"
+export output_dir="./results/sst2"
+mkdir -p ${output_dir}
+cp $0 ${output_dir}/
+
+# jbsub -q x86_24h -cores 1+1 -mem 80g -require a100 -proj LoRA -name train \
+# " \
+# python -m torch.distributed.launch --nproc_per_node=$num_gpus \
+# examples/text-classification/run_glue.py \
+# --model_name_or_path roberta-base \
+# --task_name sst2 \
+# --do_train \
+# --do_eval \
+# --max_seq_length 512 \
+# --per_device_train_batch_size 64 \
+# --gradient_accumulation_steps 2 \
+# --learning_rate 5e-4 \
+# --num_train_epochs 60 \
+# --output_dir $output_dir/model \
+# --overwrite_output_dir \
+# --logging_steps 10 \
+# --logging_dir $output_dir/log \
+# --evaluation_strategy epoch \
+# --save_steps 20000 \
+# --warmup_ratio 0.06 \
+# --apply_lora \
+# --lora_r 8 \
+# --lora_alpha 16 \
+# --seed 0 \
+# --weight_decay 0.1 \
+# > $output_dir/output.log 2>&1 "
+
+jbsub -q x86_24h -cores 1+1 -mem 80g -require a100 -proj LoRA -name train \
+" \
 python -m torch.distributed.launch --nproc_per_node=$num_gpus \
 examples/text-classification/run_glue.py \
 --model_name_or_path roberta-base \
@@ -9,7 +41,8 @@ examples/text-classification/run_glue.py \
 --do_train \
 --do_eval \
 --max_seq_length 512 \
---per_device_train_batch_size 16 \
+--per_device_train_batch_size 64 \
+--gradient_accumulation_steps 2 \
 --learning_rate 5e-4 \
 --num_train_epochs 60 \
 --output_dir $output_dir/model \
@@ -17,10 +50,8 @@ examples/text-classification/run_glue.py \
 --logging_steps 10 \
 --logging_dir $output_dir/log \
 --evaluation_strategy epoch \
---save_strategy epoch \
+--save_steps 20000 \
 --warmup_ratio 0.06 \
---apply_lora \
---lora_r 8 \
---lora_alpha 16 \
 --seed 0 \
---weight_decay 0.1
+--weight_decay 0.1 \
+> $output_dir/output.log 2>&1 "
