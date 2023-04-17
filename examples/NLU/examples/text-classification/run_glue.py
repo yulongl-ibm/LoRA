@@ -44,6 +44,9 @@ from transformers import (
 from transformers.trainer_utils import get_last_checkpoint, is_main_process
 from transformers.utils import check_min_version
 
+# SenQnn related import
+from sq1e.sen_qnn_ext import Qmodel_prep, senqnn_config_init, patch_torch_bmm
+from torch.utils.tensorboard import SummaryWriter
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
 check_min_version("4.4.0")
@@ -225,12 +228,50 @@ def main():
     # We now keep distinct sets of args, for a cleaner separation of concerns.
 
     parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments))
+
+    # --- added by Charlie for sq1e, use conventional way to add args ---
+    parser.add_argument('--nbits_w', default=32, type=int, help='weight precision')
+    parser.add_argument('--nbits_a', default=32, type=int, help='activation precision')
+    parser.add_argument('--nbits_w_qkv', default=32, type=int, help='weight precision for qkv layers')
+    parser.add_argument('--nbits_a_qkv', default=32, type=int, help='weight precision for qkv layers')
+    parser.add_argument('--nbits_bmm1', default=32, type=int, help='weight precision for bmm1')
+    parser.add_argument('--nbits_bmm2', default=32, type=int, help='weight precision for bmm2')
+    parser.add_argument('--qw_mode', type=str, default='sawb', help='weight quantization, pick from lpuq, sawb or dorefa') 
+    parser.add_argument('--qa_mode', type=str, default='pact', help='activation quantization, pick from lpuq, lsq or qil') 
+    parser.add_argument('--qw_qkv_mode', type=str, default='sawb', help='activation quantization, pick from lpuq, lsq or qil') 
+    parser.add_argument('--qa_qkv_mode', type=str, default='pact', help='activation quantization, pick from lpuq, lsq or qil') 
+    parser.add_argument('--bmm1_qm1_mode', type=str, default='pact', help='activation quantization, pick from lpuq, lsq or qil') 
+    parser.add_argument('--bmm1_qm2_mode', type=str, default='pact', help='activation quantization, pick from lpuq, lsq or qil') 
+    parser.add_argument('--bmm2_qm1_mode', type=str, default='pact', help='activation quantization, pick from lpuq, lsq or qil') 
+    parser.add_argument('--bmm2_qm2_mode', type=str, default='pact', help='activation quantization, pick from lpuq, lsq or qil') 
+    parser.add_argument('--pact_a_lr', default=0.01, type=float, help='clip val learning rate') 
+    parser.add_argument('--pact_w_lr', default=0.01, type=float, help='clip val learning rate') 
+    parser.add_argument('--a_clip_val', type=float, default=6.0, help='clip_val initial value')
+    parser.add_argument('--a_clip_valn', type=float, default=0.0, help='clip_valn initial value, specifically for QIL')
+    parser.add_argument('--w_clip_val', type=float, default=1.0, help='positive weight clip_val initial value')   
+    parser.add_argument('--w_clip_valn', type=float, default=-1.0, help='negative weight clip_val initial value')
+    parser.add_argument('--pact_a_decay', default=5e-5, type=float, help='clip val for qil pruning clip decay') 
+    parser.add_argument('--pact_w_decay', default=5e-5, type=float, help='clip val for W decay') 
+    parser.add_argument('--align_zero',  action='store_true', help='set align_zero flags in W and A quantizers to True')
+    parser.add_argument('--Qmodel_calibration',  default=0, type=int, help='Num of batches for Qmodel calibration')
+    parser.add_argument('--Qmodel_calibration_new',  default=0, type=int, help='new method for calibration')
+    parser.add_argument('--QKVsync',  action='store_true', help='synchronize clipvals of QKV layers')
+    parser.add_argument('--clip_val_asst_percentile', nargs='+', type=float, default=(0.1,99.9), help='pecentile for clip_val initialization')
+    parser.add_argument('--dropout_prob_attn', type=float, default=0.1, help='in hf3 we changed all dropout prob to 0.165')
+    parser.add_argument('--dropout_prob_hid', type=float, default=0.1, help='in hf3 we changed all dropout prob to 0.165')
+    parser.add_argument('--dropout_prob_emb', type=float, default=0.1, help='in hf3 we changed all dropout prob to 0.165')
+    parser.add_argument('--plotSVG',  action='store_true', help='save computation graphs, needs graphviz/pygraphviz')
+    # ------------------------------------------------------
+
     if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
         # If we pass only one argument to the script and it's the path to a json file,
         # let's parse it to get our arguments.
         model_args, data_args, training_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
     else:
-        model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+        model_args, data_args, training_args, sq_args = parser.parse_args_into_dataclasses()
+        training_args.report_to=[]
+        # 2 minor changes here, 1) additional args will be placed into "sq_args"
+        #                       2) set training_args.report_to=[], to disable default tensorboard, since we will use our own
 
     torch.use_deterministic_algorithms(training_args.use_deterministic_algorithms)
     logger.info("use_deterministic_algorithms: " + str(torch.are_deterministic_algorithms_enabled()))
@@ -358,6 +399,10 @@ def main():
         adapter_size=model_args.adapter_size,
         reg_loss_wgt=model_args.reg_loss_wgt,
         masking_prob=model_args.masking_prob,
+        # --- adjust dropout prob ---
+        attention_probs_dropout_prob=sq_args.dropout_prob_attn,
+        hidden_dropout_prob=sq_args.dropout_prob_hid,
+        embedding_dropout_prob = sq_args.dropout_prob_emb
     )
     tokenizer = AutoTokenizer.from_pretrained(
         model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path,
@@ -525,6 +570,45 @@ def main():
         else:
             return {"accuracy": (preds == p.label_ids).astype(np.float32).mean().item()}
 
+    # ----- added for sq1e -----
+    sqcfg = senqnn_config_init(sq_args) # we added/parsed our args in sq_args
+    tb_writer=SummaryWriter(log_dir=f"{training_args.output_dir}/runs")
+
+    class sq1eCallback(transformers.integrations.TrainerCallback):
+        "initialize sq1e at the beginning of training, see trainer.py line 1358"
+    # model, optimizer and ...etc are passed thru kwargs, 
+    # see https://github.com/huggingface/transformers/blob/v4.18.0/src/transformers/trainer_callback.py#L159
+    # NOTE there is another DefaultFlow TrainerCallback already, no need to run super().on_xxx_yyy() here
+        def __init__(self, sqcfg):
+            super().__init__()
+            self.sqcfg = sqcfg
+
+        def on_train_begin(self, args, state, control, **kwargs):
+            if self.sqcfg['Qmodel_calibration'] > 0:
+                Qmodel_prep(kwargs.get('model'), 
+                            kwargs.get('train_dataloader'), self.sqcfg, 
+                            kwargs.get('optimizer'), 
+                            prefwdproc=lambda datamb: (datamb['input_ids'].to(args.device),), 
+                            save_fname=''.join((kwargs['model'].name_or_path, '.hf4')))
+            else:
+                Qmodel_prep(kwargs.get('model'), 
+                            kwargs.get('train_dataloader'), self.sqcfg, 
+                            kwargs.get('optimizer'), 
+                            save_fname=''.join((kwargs['model'].name_or_path, '.hf4')))
+
+        def on_step_end(self, args, state, control, **kwargs):
+            if state.global_step == self.sqcfg['Qmodel_calibration_new']:
+                print( {k:v for k,v in kwargs.get('model').named_parameters() if 'clip_val' in k} )
+
+    class sq1eTBcallback(transformers.integrations.TensorBoardCallback):
+        def on_log(self, args, state, control, logs=None, **kwargs):
+            # record clip_vals
+            if self.tb_writer:
+                for k, v in kwargs.get('model').named_parameters():
+                    if 'clip_val' in k: self.tb_writer.add_scalar(k, v, state.global_step)            
+            return super().on_log(args, state, control, logs, **kwargs)
+    # --------------------------
+
     # Data collator will default to DataCollatorWithPadding, so we change it if we already did the padding.
     if data_args.pad_to_max_length:
         data_collator = default_data_collator
@@ -542,7 +626,10 @@ def main():
         compute_metrics=compute_metrics,
         tokenizer=tokenizer,
         data_collator=data_collator,
+        callbacks=[sq1eCallback(sqcfg), sq1eTBcallback(tb_writer)], #https://huggingface.co/docs/transformers/main_classes/callback
     )
+    # --- added for sq1e ---
+    trainer.sqcfg = sqcfg
 
     # Training
     if training_args.do_train:
@@ -580,7 +667,9 @@ def main():
             eval_datasets.append(datasets["validation_mismatched"])
 
         for eval_dataset, task in zip(eval_datasets, tasks):
-            metrics = trainer.evaluate(eval_dataset=eval_dataset)
+            # --- context manager ---
+            with patch_torch_bmm(sqcfg):
+                metrics = trainer.evaluate(eval_dataset=eval_dataset)
 
             max_val_samples = data_args.max_val_samples if data_args.max_val_samples is not None else len(eval_dataset)
             metrics["eval_samples"] = min(max_val_samples, len(eval_dataset))
