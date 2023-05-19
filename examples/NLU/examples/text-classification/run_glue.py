@@ -451,16 +451,18 @@ def main():
     if model_args.apply_bitfit:
         trainable_params.append('bias')
 
-    if len(trainable_params) > 0:
-        for name, param in model.named_parameters():
-            if name.startswith('deberta') or name.startswith('roberta'):
-                param.requires_grad = False
-                for trainable_param in trainable_params:
-                    if trainable_param in name:
-                        param.requires_grad = True
-                        break
-            else:
-                param.requires_grad = True
+    # Moved into trainer.py after sq1e was executed
+    # if len(trainable_params) > 0:
+    #     for name, param in model.named_parameters():
+    #         print(f'parameter name: {name}')
+    #         if name.startswith('deberta') or name.startswith('roberta'):
+    #             param.requires_grad = False
+    #             for trainable_param in trainable_params:
+    #                 if trainable_param in name:
+    #                     param.requires_grad = True
+    #                     break
+    #         else:
+    #             param.requires_grad = True
 
     # Preprocessing the datasets
     if data_args.task_name is not None:
@@ -642,7 +644,7 @@ def main():
             if AutoConfig.from_pretrained(model_args.model_name_or_path).num_labels == num_labels:
                 checkpoint = model_args.model_name_or_path
 
-        train_result = trainer.train(resume_from_checkpoint=checkpoint)
+        train_result = trainer.train(resume_from_checkpoint=checkpoint, trainable_params=trainable_params)
         metrics = train_result.metrics
         max_train_samples = (
             data_args.max_train_samples if data_args.max_train_samples is not None else len(train_dataset)

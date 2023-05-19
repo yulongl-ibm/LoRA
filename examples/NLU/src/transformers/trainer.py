@@ -827,6 +827,7 @@ class Trainer:
         self,
         resume_from_checkpoint: Optional[Union[str, bool]] = None,
         trial: Union["optuna.Trial", Dict[str, Any]] = None,
+        trainable_params: Optional[list] = None,
         **kwargs,
     ):
         """
@@ -1018,6 +1019,18 @@ class Trainer:
             state_dict = torch.load(os.path.join(resume_from_checkpoint, WEIGHTS_NAME), map_location="cpu")
             self._load_state_dict_in_model(state_dict)
             del state_dict
+
+        # Do not update most of the parameters
+        if len(trainable_params) > 0:
+            for name, param in model.named_parameters():
+                if name.startswith('deberta') or name.startswith('roberta'):
+                    param.requires_grad = False
+                    for trainable_param in trainable_params:
+                        if trainable_param in name:
+                            param.requires_grad = True
+                            break
+                else:
+                    param.requires_grad = True
 
         # Skip the first epochs_trained epochs to get the random state of the dataloader at the right point.
         if not self.args.ignore_data_skip:
@@ -1991,8 +2004,9 @@ class Trainer:
         load_result = self.model.load_state_dict(state_dict, strict=False)
 
         if len(load_result.missing_keys) != 0:
-            if set(load_result.missing_keys) == set(self.model._keys_to_ignore_on_save):
-                self.model.tie_weights()
+            if self.model._keys_to_ignore_on_save :
+                if set(load_result.missing_keys) == set(self.model._keys_to_ignore_on_save):
+                    self.model.tie_weights()
             else:
                 logger.warn(f"There were missing keys in the checkpoint model loaded: {load_result.missing_keys}.")
         if len(load_result.unexpected_keys) != 0:
