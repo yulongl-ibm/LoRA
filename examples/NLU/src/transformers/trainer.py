@@ -1019,6 +1019,12 @@ class Trainer:
             state_dict = torch.load(os.path.join(resume_from_checkpoint, WEIGHTS_NAME), map_location="cpu")
             self._load_state_dict_in_model(state_dict)
             del state_dict
+        
+        model_par = {p:n for n,p in model.named_parameters() }
+        for parameter_group in self.optimizer.param_groups:
+            for parameter in parameter_group['params']:
+                if parameter not in model_par.keys():
+                    raise Exception("model and optimzer has different parameters, this is not expected")
 
         # Do not update most of the parameters
         if len(trainable_params) > 0:
@@ -1141,8 +1147,8 @@ class Trainer:
                     if self.control.should_epoch_stop or self.control.should_training_stop:
                         break
 
-            self.control = self.callback_handler.on_epoch_end(self.args, self.state, self.control)
-            self._maybe_log_save_evaluate(tr_loss, model, trial, epoch)
+                self.control = self.callback_handler.on_epoch_end(self.args, self.state, self.control)
+                self._maybe_log_save_evaluate(tr_loss, model, trial, epoch)
 
             if self.args.tpu_metrics_debug or self.args.debug:
                 if is_torch_tpu_available():
