@@ -48,6 +48,7 @@ from transformers.utils import check_min_version
 from sq1e.sen_qnn_ext import Qmodel_prep, senqnn_config_init, patch_torch_bmm
 from torch.utils.tensorboard import SummaryWriter
 
+
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
 check_min_version("4.4.0")
 
@@ -428,6 +429,8 @@ def main():
             logger.info(lora_state_dict.keys())
             model.load_state_dict(lora_state_dict, strict=False)
         trainable_params.append('lora')
+        if sq_args.nbits_a < 32:
+            trainable_params.append("clip_val")
 
     if model_args.apply_adapter:
         if model_args.adapter_path is not None:
@@ -590,14 +593,18 @@ def main():
                 Qmodel_prep(kwargs.get('model'), 
                             kwargs.get('train_dataloader'), self.sqcfg, 
                             kwargs.get('optimizer'), 
+                            scheduler = args.lr_scheduler,
                             prefwdproc=lambda datamb: (datamb['input_ids'].to(args.device),), 
-                            save_fname=''.join((kwargs['model'].name_or_path, '.hf4')))
+                            save_fname=''.join((args.output_dir, '/model', '.hf4')))
             else:
                 Qmodel_prep(kwargs.get('model'), 
                             kwargs.get('train_dataloader'), self.sqcfg, 
                             kwargs.get('optimizer'), 
-                            save_fname=''.join((kwargs['model'].name_or_path, '.hf4')))
+                            scheduler = args.lr_scheduler,
+                            save_fname=''.join((args.output_dir, '/model', '.hf4')))
 
+                            # To addl scheduler for pact value
+                            # scheduler = args.lr_scheduler,
         def on_step_end(self, args, state, control, **kwargs):
             if state.global_step == self.sqcfg['Qmodel_calibration_new']:
                 print( {k:v for k,v in kwargs.get('model').named_parameters() if 'clip_val' in k} )
@@ -607,7 +614,9 @@ def main():
             # record clip_vals
             if self.tb_writer:
                 for k, v in kwargs.get('model').named_parameters():
-                    if 'clip_val' in k: self.tb_writer.add_scalar(k, v, state.global_step)            
+                    if 'clip_val' in k: self.tb_writer.add_scalar(k, v, state.global_step)
+                # YL: Hack to add pact_a_lr to tb
+                self.tb_writer.add_scalar('pact_a_lr', kwargs.get('optimizer').param_groups[2]['lr'], state.global_step) 
             return super().on_log(args, state, control, logs, **kwargs)
     # --------------------------
 
@@ -668,10 +677,18 @@ def main():
             tasks.append("mnli-mm")
             eval_datasets.append(datasets["validation_mismatched"])
 
+        # To make sure model is reloaded after Qmodel_prep for inference
+        trainer.sqcfg['matmul_counter'] = 0
+        if training_args.num_train_epochs == 0:
+            state_dict = torch.load(os.path.join(model_args.model_name_or_path, "pytorch_model.bin"), map_location="cpu")
+            trainer._load_state_dict_in_model(state_dict)
+            del state_dict
+
         for eval_dataset, task in zip(eval_datasets, tasks):
             # --- context manager ---
             with patch_torch_bmm(sqcfg):
                 metrics = trainer.evaluate(eval_dataset=eval_dataset)
+            # metrics = trainer.evaluate(eval_dataset=eval_dataset)
 
             max_val_samples = data_args.max_val_samples if data_args.max_val_samples is not None else len(eval_dataset)
             metrics["eval_samples"] = min(max_val_samples, len(eval_dataset))

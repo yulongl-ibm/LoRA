@@ -1005,7 +1005,7 @@ class Trainer:
         self._globalstep_last_logged = self.state.global_step
         self._total_flos = self.state.total_flos
         model.zero_grad()
-
+        self.args.lr_scheduler = self.lr_scheduler
         self.control = self.callback_handler.on_train_begin(self.args, self.state, self.control)
 
         # Load potential model checkpoint
@@ -1019,6 +1019,11 @@ class Trainer:
             state_dict = torch.load(os.path.join(resume_from_checkpoint, WEIGHTS_NAME), map_location="cpu")
             self._load_state_dict_in_model(state_dict)
             del state_dict
+        
+        # Hack to test if model are really used during LoRA
+        # for k, v in model.named_modules():
+        #     model._init_weights(model.get_submodule(k))
+        #     logger.info(f"reset parameter: {k}")
         
         model_par = {p:n for n,p in model.named_parameters() }
         for parameter_group in self.optimizer.param_groups:
@@ -1037,6 +1042,16 @@ class Trainer:
                             break
                 else:
                     param.requires_grad = True
+        
+        logger.info(f"trainable parameters:")
+        for name, param in model.named_parameters():
+            if param.requires_grad :
+                logger.info(f"{name}")
+
+        logger.info(f"frozen parameters:")
+        for name, param in model.named_parameters():
+            if not param.requires_grad :
+                logger.info(f"{name}")
 
         # Skip the first epochs_trained epochs to get the random state of the dataloader at the right point.
         if not self.args.ignore_data_skip:
@@ -1616,7 +1631,7 @@ class Trainer:
             self.tokenizer.save_pretrained(output_dir)
 
         # Good practice: save your training arguments together with the trained model
-        torch.save(self.args, os.path.join(output_dir, "training_args.bin"))
+        # torch.save(self.args, os.path.join(output_dir, "training_args.bin"))
 
     def store_flos(self):
         # Storing the number of floating-point operations that went into the model
