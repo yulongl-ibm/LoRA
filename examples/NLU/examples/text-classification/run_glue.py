@@ -254,6 +254,7 @@ def main():
     parser.add_argument('--pact_a_decay', default=5e-5, type=float, help='clip val for qil pruning clip decay') 
     parser.add_argument('--pact_w_decay', default=5e-5, type=float, help='clip val for W decay') 
     parser.add_argument('--align_zero',  action='store_true', help='set align_zero flags in W and A quantizers to True')
+    parser.add_argument('--sentient_check',  action='store_true')
     parser.add_argument('--Qmodel_calibration',  default=0, type=int, help='Num of batches for Qmodel calibration')
     parser.add_argument('--Qmodel_calibration_new',  default=0, type=int, help='new method for calibration')
     parser.add_argument('--QKVsync',  action='store_true', help='synchronize clipvals of QKV layers')
@@ -261,7 +262,9 @@ def main():
     parser.add_argument('--dropout_prob_attn', type=float, default=0.1, help='in hf3 we changed all dropout prob to 0.165')
     parser.add_argument('--dropout_prob_hid', type=float, default=0.1, help='in hf3 we changed all dropout prob to 0.165')
     parser.add_argument('--dropout_prob_emb', type=float, default=0.1, help='in hf3 we changed all dropout prob to 0.165')
+    parser.add_argument('--dropout_prob_lora', type=float, default=0.1)
     parser.add_argument('--plotSVG',  action='store_true', help='save computation graphs, needs graphviz/pygraphviz')
+    # parser.add_argument('--Qskip_layer_name', action='append', help='skip this layer in quantization') 
     # ------------------------------------------------------
 
     if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
@@ -403,7 +406,8 @@ def main():
         # --- adjust dropout prob ---
         attention_probs_dropout_prob=sq_args.dropout_prob_attn,
         hidden_dropout_prob=sq_args.dropout_prob_hid,
-        embedding_dropout_prob = sq_args.dropout_prob_emb
+        embedding_dropout_prob = sq_args.dropout_prob_emb,
+        lora_dropout_prob = sq_args.dropout_prob_lora
     )
     tokenizer = AutoTokenizer.from_pretrained(
         model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path,
@@ -616,7 +620,7 @@ def main():
                 for k, v in kwargs.get('model').named_parameters():
                     if 'clip_val' in k: self.tb_writer.add_scalar(k, v, state.global_step)
                 # YL: Hack to add pact_a_lr to tb
-                self.tb_writer.add_scalar('pact_a_lr', kwargs.get('optimizer').param_groups[2]['lr'], state.global_step) 
+                # self.tb_writer.add_scalar('pact_a_lr', kwargs.get('optimizer').param_groups[2]['lr'], state.global_step) 
             return super().on_log(args, state, control, logs, **kwargs)
     # --------------------------
 
