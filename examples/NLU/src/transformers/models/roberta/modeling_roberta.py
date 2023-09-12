@@ -164,15 +164,12 @@ class RobertaSelfAttention(nn.Module):
 
         if config.apply_lora:
             self.query = lora.Linear(config.hidden_size, self.all_head_size, config.lora_r, lora_alpha=config.lora_alpha)
+            self.value = lora.Linear(config.hidden_size, self.all_head_size, config.lora_r, lora_alpha=config.lora_alpha)
+            self.key = lora.Linear(config.hidden_size, self.all_head_size, config.lora_r, lora_alpha=config.lora_alpha)
         else:
             self.query = nn.Linear(config.hidden_size, self.all_head_size)
-        
-        self.key = nn.Linear(config.hidden_size, self.all_head_size)
-
-        if config.apply_lora:
-            self.value = lora.Linear(config.hidden_size, self.all_head_size, config.lora_r, lora_alpha=config.lora_alpha)
-        else:
             self.value = nn.Linear(config.hidden_size, self.all_head_size)
+            self.key = nn.Linear(config.hidden_size, self.all_head_size)
 
         self.dropout = nn.Dropout(config.attention_probs_dropout_prob)
         self.position_embedding_type = getattr(config, "position_embedding_type", "absolute")
@@ -286,7 +283,10 @@ class RobertaSelfAttention(nn.Module):
 class RobertaSelfOutput(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.dense = nn.Linear(config.hidden_size, config.hidden_size)
+        if config.apply_lora:
+            self.dense = lora.Linear(config.hidden_size, config.hidden_size, config.lora_r, lora_alpha=config.lora_alpha)
+        else:
+            self.dense = nn.Linear(config.hidden_size, config.hidden_size)
         self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
         if config.apply_adapter and config.adapter_type == 'houlsby':
@@ -355,7 +355,10 @@ class RobertaAttention(nn.Module):
 class RobertaIntermediate(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.dense = nn.Linear(config.hidden_size, config.intermediate_size)
+        if config.apply_lora:
+            self.dense = lora.Linear(config.hidden_size, config.intermediate_size, config.lora_r, lora_alpha=config.lora_alpha)
+        else:
+            self.dense = nn.Linear(config.hidden_size, config.intermediate_size)
         if isinstance(config.hidden_act, str):
             self.intermediate_act_fn = ACT2FN[config.hidden_act]
         else:
@@ -371,7 +374,10 @@ class RobertaIntermediate(nn.Module):
 class RobertaOutput(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.dense = nn.Linear(config.intermediate_size, config.hidden_size)
+        if config.apply_lora:
+            self.dense = lora.Linear(config.intermediate_size, config.hidden_size, config.lora_r, lora_alpha=config.lora_alpha)
+        else:
+            self.dense = nn.Linear(config.intermediate_size, config.hidden_size)
         self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
         self.adapter_type = config.adapter_type
@@ -1427,7 +1433,10 @@ class RobertaClassificationHead(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.dense = nn.Linear(config.hidden_size, config.hidden_size)
+        if config.apply_lora:
+            self.dense = lora.Linear(config.hidden_size, config.hidden_size, config.lora_r, lora_alpha=config.lora_alpha)
+        else:
+            self.dense = nn.Linear(config.hidden_size, config.hidden_size)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
         self.out_proj = nn.Linear(config.hidden_size, config.num_labels)
 
