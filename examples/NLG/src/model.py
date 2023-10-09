@@ -363,7 +363,7 @@ class GPT2LMModel(nn.Module):
         _batch, _len = input_ids.shape
         # hidden_states, presents = self.transformer(input_ids, past=past, len_past=len_past)
         # transformers_out = self.transformer(input_ids, past_key_values=past)
-        transformers_out = self.transformer(input_ids)
+        transformers_out = self.transformer(input_ids, past_key_values=past)
         hidden_states, presents = transformers_out['last_hidden_state'], transformers_out['past_key_values']
 
         # batch, seq, vocab
