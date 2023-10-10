@@ -133,3 +133,7 @@ post/
 *.nupkg
 /Packages
 
+examples/NLU/results
+examples/NLU/debug
+examples/NLG/data
+examples/NLG/results
