@@ -34,8 +34,11 @@ from model import GPT2Config, GPT2LMModel
 from exp_utils import create_exp_dir
 
 from peft import LoraConfig, TaskType, get_peft_model
+from peft.tuners.lora.layer import Linear as peft_Linear
 
-# import loralib as lora
+from sq1e.sen_qnn_ext import Qmodel_prep, senqnn_config_init, patch_torch_bmm
+from sq1e.sen_qnn_infer import QLoRALinear
+from torch.utils.tensorboard import SummaryWriter
 
 parser = argparse.ArgumentParser(description='PyTorch GPT2 ft script')
 # add_gpu_params(parser)
@@ -102,6 +105,40 @@ parser.add_argument("--world_size", default=1, type=int, help='world size')
 parser.add_argument("--local-rank", default=0, type=int, help='local rank')
 
 parser.add_argument("--device", default=0, type=int, help='device')
+
+# Add sq1e related parameters
+parser.add_argument('--nbits_w', default=32, type=int, help='weight precision')
+parser.add_argument('--nbits_a', default=32, type=int, help='activation precision')
+parser.add_argument('--nbits_w_qkv', default=32, type=int, help='weight precision for qkv layers')
+parser.add_argument('--nbits_a_qkv', default=32, type=int, help='weight precision for qkv layers')
+parser.add_argument('--nbits_bmm1', default=32, type=int, help='weight precision for bmm1')
+parser.add_argument('--nbits_bmm2', default=32, type=int, help='weight precision for bmm2')
+parser.add_argument('--qw_mode', type=str, default='sawb', help='weight quantization, pick from lpuq, sawb or dorefa') 
+parser.add_argument('--qa_mode', type=str, default='pact', help='activation quantization, pick from lpuq, lsq or qil') 
+parser.add_argument('--qw_qkv_mode', type=str, default='sawb', help='activation quantization, pick from lpuq, lsq or qil') 
+parser.add_argument('--qa_qkv_mode', type=str, default='pact', help='activation quantization, pick from lpuq, lsq or qil') 
+parser.add_argument('--bmm1_qm1_mode', type=str, default='pact', help='activation quantization, pick from lpuq, lsq or qil') 
+parser.add_argument('--bmm1_qm2_mode', type=str, default='pact', help='activation quantization, pick from lpuq, lsq or qil') 
+parser.add_argument('--bmm2_qm1_mode', type=str, default='pact', help='activation quantization, pick from lpuq, lsq or qil') 
+parser.add_argument('--bmm2_qm2_mode', type=str, default='pact', help='activation quantization, pick from lpuq, lsq or qil') 
+parser.add_argument('--pact_a_lr', default=0.01, type=float, help='clip val learning rate') 
+parser.add_argument('--pact_w_lr', default=0.01, type=float, help='clip val learning rate') 
+parser.add_argument('--a_clip_val', type=float, default=6.0, help='clip_val initial value')
+parser.add_argument('--a_clip_valn', type=float, default=0.0, help='clip_valn initial value, specifically for QIL')
+parser.add_argument('--w_clip_val', type=float, default=1.0, help='positive weight clip_val initial value')   
+parser.add_argument('--w_clip_valn', type=float, default=-1.0, help='negative weight clip_val initial value')
+parser.add_argument('--pact_a_decay', default=5e-5, type=float, help='clip val for qil pruning clip decay') 
+parser.add_argument('--pact_w_decay', default=5e-5, type=float, help='clip val for W decay') 
+parser.add_argument('--align_zero',  action='store_true', help='set align_zero flags in W and A quantizers to True')
+parser.add_argument('--sentient_check',  action='store_true')
+parser.add_argument('--Qmodel_calibration',  default=0, type=int, help='Num of batches for Qmodel calibration')
+parser.add_argument('--Qmodel_calibration_new',  default=0, type=int, help='new method for calibration')
+parser.add_argument('--QKVsync',  action='store_true', help='synchronize clipvals of QKV layers')
+parser.add_argument('--clip_val_asst_percentile', nargs='+', type=float, default=(0.1,99.9), help='pecentile for clip_val initialization')
+parser.add_argument('--dropout_prob_attn', type=float, default=0.1, help='in hf3 we changed all dropout prob to 0.165')
+parser.add_argument('--dropout_prob_hid', type=float, default=0.1, help='in hf3 we changed all dropout prob to 0.165')
+parser.add_argument('--dropout_prob_emb', type=float, default=0.1, help='in hf3 we changed all dropout prob to 0.165')
+parser.add_argument('--plotSVG',  action='store_true', help='save computation graphs, needs graphviz/pygraphviz')
 
 # influence model, calculate the influence score between two samples.
 def print_args(args):
@@ -187,7 +224,8 @@ def train_validate(
     scheduler, 
     train_loader, 
     valid_loader, 
-    args, 
+    args,
+    sqcfg,
     train_step=0, 
     epoch=0
 ):
@@ -199,72 +237,82 @@ def train_validate(
 
     # train_loader.sampler.set_epoch(epoch)
 
-    for idx, data in enumerate(train_loader):
-        data = {key: value for key, value in data.items()}
+    with patch_torch_bmm(sqcfg):
+        for idx, data in enumerate(train_loader):
+            data = {key: value for key, value in data.items()}
 
-        _input = data['input'].to(args.device)
-        _target = data['target'].to(args.device)
-        _msk = data['mask'].to(args.device)
+            _input = data['input'].to(args.device)
+            _target = data['target'].to(args.device)
+            _msk = data['mask'].to(args.device)
 
-        # _lm_logits, _lm_loss = model(
-        #     _input, lm_labels=_target, lm_mask=_msk, label_smooth=args.label_smooth
-        # ) 
-        _lm_logits, _lm_loss = model(
-            input_ids=_input, lm_labels=_target, lm_mask=_msk, label_smooth=args.label_smooth
-        ) 
+            # _lm_logits, _lm_loss = model(
+            #     _input, lm_labels=_target, lm_mask=_msk, label_smooth=args.label_smooth
+            # ) 
+            _lm_logits, _lm_loss = model(
+                input_ids=_input, lm_labels=_target, lm_mask=_msk, label_smooth=args.label_smooth
+            ) 
 
-        _lm_loss = _lm_loss.mean() 
+            _lm_loss = _lm_loss.mean() 
 
-        train_step += 1
-        is_update = True if train_step % args.grad_acc == 0 else False
-        avg_lm_loss.update(_lm_loss.item())
-        optimizer_step(
-            _lm_loss/(args.grad_acc), optimizer, model, scheduler, args, is_update=is_update
-        )
-        
-        if train_step % args.log_interval == 0: 
-            elapsed = time.time() - log_start_time
-            lr = optimizer.param_groups[0]['lr']
-            log_str = f'| epoch {epoch:3d} step {train_step:>8d} | { idx + 1:>6d} batches | ' \
-                      f'lr {lr:.3g} | ms/batch {elapsed * 1000 / args.log_interval:5.2f} | ' \
-                      f'loss {avg_lm_loss.val:5.2f} | avg loss {avg_lm_loss.avg:5.2f} | ' \
-                      f'ppl {math.exp(avg_lm_loss.avg):5.2f}'
+            train_step += 1
+            is_update = True if train_step % args.grad_acc == 0 else False
+            avg_lm_loss.update(_lm_loss.item())
+            optimizer_step(
+                _lm_loss/(args.grad_acc), optimizer, model, scheduler, args, is_update=is_update
+            )
+            
+            if train_step % args.log_interval == 0: 
+                elapsed = time.time() - log_start_time
+                lr = optimizer.param_groups[0]['lr']
+                log_str = f'| epoch {epoch:3d} step {train_step:>8d} | { idx + 1:>6d} batches | ' \
+                        f'lr {lr:.3g} | ms/batch {elapsed * 1000 / args.log_interval:5.2f} | ' \
+                        f'loss {avg_lm_loss.val:5.2f} | avg loss {avg_lm_loss.avg:5.2f} | ' \
+                        f'ppl {math.exp(avg_lm_loss.avg):5.2f}'
 
-            if args.rank == 0: 
-                print(log_str)
-            log_start_time = time.time()
-            avg_lm_loss.reset()
-        
-        if train_step % args.save_interval == 0: 
-            if args.rank == 0:
-                model_path = os.path.join(args.work_dir, f'model.{train_step}.pt')
-                print('saving checkpoint', model_path)
-                # torch.save({'model_state_dict': lora.lora_state_dict(model)}, model_path)
-            # distributed_sync(args)
+                for k, v in model.named_parameters():
+                    if 'clip_val' in k: tb_writer.add_scalar(k, v, train_step)
+                tb_writer.add_scalar("training loss", avg_lm_loss.val, train_step)
+                tb_writer.add_scalar("avg training loss", avg_lm_loss.avg, train_step)
+                tb_writer.add_scalar("ppl", math.exp(avg_lm_loss.avg), train_step)
 
-        # evaluation interval
-        if train_step % args.eval_interval == 0:
-            eval_start_time = time.time()
+                if args.rank == 0: 
+                    print(log_str)
+                log_start_time = time.time()
+                avg_lm_loss.reset()
+            
+            if train_step % args.save_interval == 0: 
+                if args.rank == 0:
+                    model_path = os.path.join(args.work_dir, f'model.{train_step}.pt')
+                    print('saving checkpoint', model_path)
+                    # torch.save({'model_state_dict': lora.lora_state_dict(model)}, model_path)
+                # distributed_sync(args)
 
-            valid_loss, valid_ppl = evaluate(model, valid_loader, args)
+            # evaluation interval
+            if train_step % args.eval_interval == 0:
+                eval_start_time = time.time()
 
-            if best_val_ppl is None or valid_ppl < best_val_ppl:
-                best_val_ppl = valid_ppl
-                
-            log_str = f'| Eval {train_step // args.eval_interval:3d} at step {train_step:>8d} | ' \
-                      f'time: {time.time() - eval_start_time:5.2f}s | valid loss {valid_loss:5.2f} | ' \
-                      f'valid ppl {valid_ppl:5.2f} | best ppl {best_val_ppl:5.2f} '
+                valid_loss, valid_ppl = evaluate(model, valid_loader, args)
 
-            if args.rank == 0:
-                print('-' * 100)
-                print(log_str)
-                print('-' * 100)
+                if best_val_ppl is None or valid_ppl < best_val_ppl:
+                    best_val_ppl = valid_ppl
+                    
+                log_str = f'| Eval {train_step // args.eval_interval:3d} at step {train_step:>8d} | ' \
+                        f'time: {time.time() - eval_start_time:5.2f}s | valid loss {valid_loss:5.2f} | ' \
+                        f'valid ppl {valid_ppl:5.2f} | best ppl {best_val_ppl:5.2f} '
 
-            model.train()
-            # distributed_sync(args)
+                tb_writer.add_scalar("valid loss", valid_loss, train_step)
+                tb_writer.add_scalar("valid_ppl", valid_ppl, train_step)
 
-        if train_step == args.max_step:
-            break
+                if args.rank == 0:
+                    print('-' * 100)
+                    print(log_str)
+                    print('-' * 100)
+
+                model.train()
+                # distributed_sync(args)
+
+            if train_step == args.max_step:
+                break
 
     if args.rank == 0:
         model_path = os.path.join(args.work_dir, f'model.{train_step}.pt')
@@ -325,6 +373,10 @@ if __name__ == '__main__':
             # lora_attn_dim=args.lora_dim, 
             # lora_attn_alpha=args.lora_alpha, 
             # lora_dropout=args.lora_dropout,
+            # --- adjust dropout prob ---
+            # attention_probs_dropout_prob=args.dropout_prob_attn,
+            # hidden_dropout_prob=args.dropout_prob_hid,
+            # embedding_dropout_prob=args.dropout_prob_emb,
         )
     elif args.model_card == 'gpt2.lg':
         config = GPT2Config(
@@ -356,20 +408,9 @@ if __name__ == '__main__':
                                  lora_dropout=args.lora_dropout,
                                  target_modules=target_modules)
         lm_net= get_peft_model(lm_net, peft_config)
-        # For GPT2 wte weights are used for both embedding and last linear projection, therefore needs to train
-        # for name, param in lm_net.named_parameters():
-        #     if 'wte' in name:
-        #         param.requires_grad = True
+
         lm_net.print_trainable_parameters()
         print(lm_net)
-        print(f"trainable parameters:")
-        for name, param in lm_net.named_parameters():
-            if param.requires_grad :
-                print(f"{name}")
-        print(f"frozen parameters:")
-        for name, param in lm_net.named_parameters():
-            if not param.requires_grad :
-                print(f"{name}")
 
     optimizer = create_adam_optimizer_from_args(lm_net, args)
 
@@ -382,11 +423,37 @@ if __name__ == '__main__':
         lm_net, optimizer = amp.initialize(lm_net, optimizer, opt_level="O1")
     # lm_net, optimizer = distributed_opt(args, lm_net, optimizer, grad_acc=args.grad_acc)
 
+    # ----- added for sq1e -----
+    sqcfg = senqnn_config_init(args) # we added/parsed our args in sq_args
+    tb_writer=SummaryWriter(log_dir=f"{args.work_dir}/runs")
+    sqcfg['dropout_prob_lora'] = args.lora_dropout
+    sqcfg['mapping'][peft_Linear]={"from": peft_Linear, "to": QLoRALinear}
+
+    # prepare the model for quantization
+    if sqcfg['Qmodel_calibration'] > 0:
+        Qmodel_prep(lm_net, train_loader, sqcfg, 
+                    optimizer=optimizer, scheduler=scheduler,
+                    prefwdproc=lambda datamb: (datamb['input_ids'].to(args.device),), 
+                    save_fname=''.join((args.work_dir, '/model', '.hf4')))
+    else:
+        Qmodel_prep(lm_net, train_loader, sqcfg, 
+                    optimizer=optimizer, scheduler=scheduler,
+                    save_fname=''.join((args.work_dir, '/model', '.hf4')))
+
+    print(f"trainable parameters:")
+    for name, param in lm_net.named_parameters():
+        if param.requires_grad :
+            print(f"{name}")
+    print(f"frozen parameters:")
+    for name, param in lm_net.named_parameters():
+        if not param.requires_grad :
+            print(f"{name}")
+
     try:
         train_step = 0
         for epoch in itertools.count(start=1):
             train_step = train_validate(
-                lm_net, optimizer, scheduler, train_loader, valid_loader, args, 
+                lm_net, optimizer, scheduler, train_loader, valid_loader, args, sqcfg,
                 train_step=train_step, epoch=epoch
             )
             

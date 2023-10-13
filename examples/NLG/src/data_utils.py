@@ -256,6 +256,8 @@ class FT_Dataset(Dataset):
         output["target"] = torch.tensor(_target, dtype=torch.long) 
 
         output["mask"] = torch.tensor(_msk, dtype=torch.float)
+        #sq1e compatability
+        output["input_ids"] = torch.tensor(_input, dtype=torch.long) 
         return output
 
     def read_ft_file(self, ft_file):
