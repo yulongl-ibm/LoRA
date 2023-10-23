@@ -285,6 +285,7 @@ def train_validate(
                     model_path = os.path.join(args.work_dir, f'model.{train_step}.pt')
                     print('saving checkpoint', model_path)
                     # torch.save({'model_state_dict': lora.lora_state_dict(model)}, model_path)
+                    torch.save({'model_state_dict': model.state_dict()}, model_path) 
                 # distributed_sync(args)
 
             # evaluation interval

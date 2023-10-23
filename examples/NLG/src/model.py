@@ -169,6 +169,7 @@ def _gelu_python(x):
 
 #                 past_key, past_value = layer_past[0], layer_past[1]
 
+#                 # Update key and values
 #                 past_key[_batch,:,len_past,:] = key.squeeze(-1)
 #                 past_value[_batch,:,len_past,:] = value.squeeze(-2)
 
@@ -358,12 +359,13 @@ class GPT2LMModel(nn.Module):
         output_attentions=None,
         output_hidden_states=None,
         return_dict=False,
-        labels=None
+        labels=None,
+        position_ids=None
     ):
         _batch, _len = input_ids.shape
         # hidden_states, presents = self.transformer(input_ids, past=past, len_past=len_past)
-        # transformers_out = self.transformer(input_ids, past_key_values=past)
-        transformers_out = self.transformer(input_ids, past_key_values=past)
+        # For HF gpt2
+        transformers_out = self.transformer(input_ids, past_key_values=past, position_ids=position_ids)
         hidden_states, presents = transformers_out['last_hidden_state'], transformers_out['past_key_values']
 
         # batch, seq, vocab

@@ -34,6 +34,11 @@ from exp_utils import create_exp_dir
 from data_utils import FT_Dataset 
 from model import GPT2Config, GPT2LMModel
 
+from peft import LoraConfig, TaskType, get_peft_model
+from peft.tuners.lora.layer import Linear as peft_Linear
+
+from sq1e.sen_qnn_ext import Qmodel_prep, senqnn_config_init, patch_torch_bmm
+from sq1e.sen_qnn_infer import QLoRALinear
 
 parser = argparse.ArgumentParser(description='PyTorch GPT2 beam decoding')
 
@@ -63,6 +68,8 @@ parser.add_argument('--lora_dim', type=int, default=0, help='lora attn dimension
 
 parser.add_argument('--lora_alpha', type=int, default=128, help='lora attn alpha')
 
+parser.add_argument('--lora_dropout', default=0.0, type=float, help='dropout probability for lora layers')
+
 parser.add_argument('--work_dir', type=str, default=os.getenv('PT_OUTPUT_DIR', 'gpt2_model'), 
                     help='working folder')
 
@@ -91,6 +98,40 @@ parser.add_argument("--world_size", default=1, type=int, help='world size')
 parser.add_argument("--local-rank", default=0, type=int, help='local rank')
 
 parser.add_argument("--device", default=0, type=int, help='device')
+
+# Add sq1e related parameters
+parser.add_argument('--nbits_w', default=32, type=int, help='weight precision')
+parser.add_argument('--nbits_a', default=32, type=int, help='activation precision')
+parser.add_argument('--nbits_w_qkv', default=32, type=int, help='weight precision for qkv layers')
+parser.add_argument('--nbits_a_qkv', default=32, type=int, help='weight precision for qkv layers')
+parser.add_argument('--nbits_bmm1', default=32, type=int, help='weight precision for bmm1')
+parser.add_argument('--nbits_bmm2', default=32, type=int, help='weight precision for bmm2')
+parser.add_argument('--qw_mode', type=str, default='sawb', help='weight quantization, pick from lpuq, sawb or dorefa') 
+parser.add_argument('--qa_mode', type=str, default='pact', help='activation quantization, pick from lpuq, lsq or qil') 
+parser.add_argument('--qw_qkv_mode', type=str, default='sawb', help='activation quantization, pick from lpuq, lsq or qil') 
+parser.add_argument('--qa_qkv_mode', type=str, default='pact', help='activation quantization, pick from lpuq, lsq or qil') 
+parser.add_argument('--bmm1_qm1_mode', type=str, default='pact', help='activation quantization, pick from lpuq, lsq or qil') 
+parser.add_argument('--bmm1_qm2_mode', type=str, default='pact', help='activation quantization, pick from lpuq, lsq or qil') 
+parser.add_argument('--bmm2_qm1_mode', type=str, default='pact', help='activation quantization, pick from lpuq, lsq or qil') 
+parser.add_argument('--bmm2_qm2_mode', type=str, default='pact', help='activation quantization, pick from lpuq, lsq or qil') 
+parser.add_argument('--pact_a_lr', default=0.01, type=float, help='clip val learning rate') 
+parser.add_argument('--pact_w_lr', default=0.01, type=float, help='clip val learning rate') 
+parser.add_argument('--a_clip_val', type=float, default=6.0, help='clip_val initial value')
+parser.add_argument('--a_clip_valn', type=float, default=0.0, help='clip_valn initial value, specifically for QIL')
+parser.add_argument('--w_clip_val', type=float, default=1.0, help='positive weight clip_val initial value')   
+parser.add_argument('--w_clip_valn', type=float, default=-1.0, help='negative weight clip_val initial value')
+parser.add_argument('--pact_a_decay', default=5e-5, type=float, help='clip val for qil pruning clip decay') 
+parser.add_argument('--pact_w_decay', default=5e-5, type=float, help='clip val for W decay') 
+parser.add_argument('--align_zero',  action='store_true', help='set align_zero flags in W and A quantizers to True')
+parser.add_argument('--sentient_check',  action='store_true')
+parser.add_argument('--Qmodel_calibration',  default=0, type=int, help='Num of batches for Qmodel calibration')
+parser.add_argument('--Qmodel_calibration_new',  default=0, type=int, help='new method for calibration')
+parser.add_argument('--QKVsync',  action='store_true', help='synchronize clipvals of QKV layers')
+parser.add_argument('--clip_val_asst_percentile', nargs='+', type=float, default=(0.1,99.9), help='pecentile for clip_val initialization')
+parser.add_argument('--dropout_prob_attn', type=float, default=0.1, help='in hf3 we changed all dropout prob to 0.165')
+parser.add_argument('--dropout_prob_hid', type=float, default=0.1, help='in hf3 we changed all dropout prob to 0.165')
+parser.add_argument('--dropout_prob_emb', type=float, default=0.1, help='in hf3 we changed all dropout prob to 0.165')
+parser.add_argument('--plotSVG',  action='store_true', help='save computation graphs, needs graphviz/pygraphviz')
 
 def print_args(args):
     if args.rank == 0:
@@ -218,153 +259,148 @@ def _add_beam_candidate(
             beam_scores.view(-1)[_i] = -float("inf")
 
 
-def beam(model, data_iter, args):
+def beam(model, data_iter, args, sqcfg):
     model.eval()
     total_loss = 0.
     start_time = time.time()
 
     all_predictions = {}
     with torch.no_grad():
-        for idx, data in enumerate(data_iter):
-            data = {key: value for key, value in data.items()}
+        with patch_torch_bmm(sqcfg):
+            for idx, data in enumerate(data_iter):
+                data = {key: value for key, value in data.items()}
 
-            _id = data['id'].to(args.device)
-            _query = data['query'].to(args.device)
-            _query_len = data['query_len'].to(args.device)
-
-            ## local adaptation start.
-
-            ## local adaptation end.
+                _id = data['id'].to(args.device)
+                _query = data['query'].to(args.device)
+                _query_len = data['query_len'].to(args.device)
+                _query = _query[:,:_query_len] # only load valid tokens, to work with HF GPT2 without past_len parameter
 
 
-            output = None
-            score = None
+                ## local adaptation start.
 
-            batch_size = _id.size(0)
-            num_beams = args.beam
-            length_penalty = args.length_penalty
+                ## local adaptation end.
 
-            _batch = torch.arange(0, _id.size(0), device=args.device, dtype=torch.long)
-            
-            past = None
-            len_past = None
 
-            _query = _query.repeat(1, num_beams).view(batch_size * num_beams, -1)
-            _query_len = _query_len.unsqueeze(-1).repeat(1, num_beams).view(-1)
+                output = None
+                score = None
 
-            _bbatch = _batch.unsqueeze(-1).repeat(1, num_beams).view(-1)
-            _attention_mask = (_query > 0).int()
-            
-            # scores for each sentence in the beam
-            beam_scores = torch.zeros(
-                (batch_size, num_beams), dtype=torch.float, device=_query.device
-            )
+                batch_size = _id.size(0)
+                num_beams = args.beam
+                length_penalty = args.length_penalty
 
-            best_sequence = torch.zeros(
-                (batch_size, args.eval_len), dtype=torch.long, device=_query.device
-            )
-            best_score = {}
-
-            history = None
-            with torch.no_grad():
-                for i in range(0, args.eval_len):
-                    if i == 0:
-                        logits, past = model(_query) 
-                        logits = logits[_bbatch, (_query_len-1).long(), :] # batch_size * beam, vocab
-                    else:
-                        #print('token_id.shape', token_id.shape, token_id)
-                        #print('past.shape', past[0].shape)
-                        #print('len_past.shape', len_past.shape, len_past)
-                        
-                        # YL: update attention mask
-                        for mask, len in zip(_attention_mask, len_past):
-                            mask[len] = 1
-                        #TODO: fix this
-                        position_ids = (len_past).unsqueeze(1)
-                        aa = [list(p) for p in past]
-                        for p_layer in aa:
-                            for p_kv in p_layer:
-                                p_kv = p_kv[:,:,0:len_past[0].item(),:] 
-                        logits, past = model(token_id, past=past, len_past=len_past, attention_mask=_attention_mask, position_ids=position_ids) 
-
-                        logits = logits[:, -1, :]    # batch_size * beam, vocab
-
-                    logits = _postprocess_next_token_scores(           
-                        logits,
-                        history,
-                        i,
-                        batch_size,
-                        num_beams,
-                        repetition_penalty=args.repetition_penalty,                                
-                        no_repeat_ngram_size=args.no_repeat_ngram_size,
-                        min_length=args.min_length,
-                        eos_token_id=args.eos_token_id,
-                    )
-
-                    softmax_probs = F.softmax(logits, dim=-1)
-                    ##_prob, _w_idx = torch.topk(softmax_probs, num_beams) # batch_size, beam
-
-                    vocab_size = softmax_probs.shape[-1] 
-                    
-
-                    _logprob = torch.log(softmax_probs) # batch_size * beam, vocab
-                    if i == 0:
-                        next_scores = _logprob.view(batch_size, num_beams, -1)[:, 0, :] # batch_size, vocab
-                        
-                    else:
-                        next_scores = beam_scores.unsqueeze(-1) + _logprob.view(batch_size, num_beams, -1)
-                        next_scores = next_scores.view(batch_size, -1) # batch_size, beam * vocab
-
-                    next_scores, next_tokens = torch.topk(
-                        next_scores, num_beams, dim=1, largest=True, sorted=True
-                    )     # batch_size, num_beams
-                    
-                    beam_id = (next_tokens // vocab_size).view(-1)    # batch_size * num_beams
-                    token_id = (next_tokens % vocab_size).view(-1).unsqueeze(-1) # batch_size, num_beams
-
-                    beam_idx = beam_id.view(batch_size, num_beams) + (_batch * num_beams).unsqueeze(-1)
-                    past = _reorder_cache(past, beam_idx.view(-1))                
-                    beam_scores = next_scores # batch_size, num_beams
-                    len_past = (_query_len + i).long()
-
-                    if history is None:
-                        history = token_id.detach()
-                    else:
-                        history = torch.cat((history[beam_idx.view(-1)], token_id.detach()), dim=1).detach()
-
-                    _add_beam_candidate(
-                        best_score, best_sequence, batch_size, num_beams, beam_scores, history, 
-                        eos_token_id=args.eos_token_id
-                    )
+                _batch = torch.arange(0, _id.size(0), device=args.device, dtype=torch.long)
                 
-                _add_beam_candidate(
-                    best_score, best_sequence, batch_size, num_beams, beam_scores, history
+                past = None
+                len_past = None
+
+                _query = _query.repeat(1, num_beams).view(batch_size * num_beams, -1)
+                _query_len = _query_len.unsqueeze(-1).repeat(1, num_beams).view(-1)
+
+                _bbatch = _batch.unsqueeze(-1).repeat(1, num_beams).view(-1)
+                _attention_mask = (_query > 0).int()
+                
+                # scores for each sentence in the beam
+                beam_scores = torch.zeros(
+                    (batch_size, num_beams), dtype=torch.float, device=_query.device
                 )
 
+                best_sequence = torch.zeros(
+                    (batch_size, args.eval_len), dtype=torch.long, device=_query.device
+                )
+                best_score = {}
 
-            # with torch.no_grad():
-            #     _id = distributed_gather(args, _id)
-            #     output = distributed_gather(args, best_sequence)
-            #     #score = distributed_gather(args, score)
-            #     # distributed_sync(args)
+                history = None
+                with torch.no_grad():
+                    for i in range(0, args.eval_len):
+                        if i == 0:
+                            logits, past = model(_query) 
+                            logits = logits[_bbatch, (_query_len-1).long(), :] # batch_size * beam, vocab
+                        else:
+                            #print('token_id.shape', token_id.shape, token_id)
+                            #print('past.shape', past[0].shape)
+                            #print('len_past.shape', len_past.shape, len_past)
+                            
+                            position_ids = (len_past).unsqueeze(1)
+                            logits, past = model(token_id, past=past, len_past=len_past, position_ids=position_ids) 
 
-            # For single GPU case:
-            output = best_sequence
+                            logits = logits[:, -1, :]    # batch_size * beam, vocab
 
-            if args.rank == 0:
-                _id = _id.view(-1).cpu()
-                output = output.view(-1, output.shape[-1]).cpu()
-                #score = score.view(-1, score.shape[-1]).cpu()
+                        logits = _postprocess_next_token_scores(           
+                            logits,
+                            history,
+                            i,
+                            batch_size,
+                            num_beams,
+                            repetition_penalty=args.repetition_penalty,                                
+                            no_repeat_ngram_size=args.no_repeat_ngram_size,
+                            min_length=args.min_length,
+                            eos_token_id=args.eos_token_id,
+                        )
 
-                for _b in range(0, _id.shape[-1]):
-                    _i = int(_id[_b].item())
-                    all_predictions[_i] = {}
-                    all_predictions[_i]['id'] = _i
-                    all_predictions[_i]['predict'] = output[_b].tolist()
-                    #all_predictions[_i]['score'] = score[_b].tolist()
+                        softmax_probs = F.softmax(logits, dim=-1)
+                        ##_prob, _w_idx = torch.topk(softmax_probs, num_beams) # batch_size, beam
 
-                if idx % 10 == 0:
-                    print('inference samples', idx)
+                        vocab_size = softmax_probs.shape[-1] 
+                        
+
+                        _logprob = torch.log(softmax_probs) # batch_size * beam, vocab
+                        if i == 0:
+                            next_scores = _logprob.view(batch_size, num_beams, -1)[:, 0, :] # batch_size, vocab
+                            
+                        else:
+                            next_scores = beam_scores.unsqueeze(-1) + _logprob.view(batch_size, num_beams, -1)
+                            next_scores = next_scores.view(batch_size, -1) # batch_size, beam * vocab
+
+                        next_scores, next_tokens = torch.topk(
+                            next_scores, num_beams, dim=1, largest=True, sorted=True
+                        )     # batch_size, num_beams
+                        
+                        beam_id = (next_tokens // vocab_size).view(-1)    # batch_size * num_beams
+                        token_id = (next_tokens % vocab_size).view(-1).unsqueeze(-1) # batch_size, num_beams
+
+                        beam_idx = beam_id.view(batch_size, num_beams) + (_batch * num_beams).unsqueeze(-1)
+                        past = _reorder_cache(past, beam_idx.view(-1))                
+                        beam_scores = next_scores # batch_size, num_beams
+                        len_past = (_query_len + i).long()
+
+                        if history is None:
+                            history = token_id.detach()
+                        else:
+                            history = torch.cat((history[beam_idx.view(-1)], token_id.detach()), dim=1).detach()
+
+                        _add_beam_candidate(
+                            best_score, best_sequence, batch_size, num_beams, beam_scores, history, 
+                            eos_token_id=args.eos_token_id
+                        )
+                    
+                    _add_beam_candidate(
+                        best_score, best_sequence, batch_size, num_beams, beam_scores, history
+                    )
+
+
+                # with torch.no_grad():
+                #     _id = distributed_gather(args, _id)
+                #     output = distributed_gather(args, best_sequence)
+                #     #score = distributed_gather(args, score)
+                #     # distributed_sync(args)
+
+                # For single GPU case:
+                output = best_sequence
+
+                if args.rank == 0:
+                    _id = _id.view(-1).cpu()
+                    output = output.view(-1, output.shape[-1]).cpu()
+                    #score = score.view(-1, score.shape[-1]).cpu()
+
+                    for _b in range(0, _id.shape[-1]):
+                        _i = int(_id[_b].item())
+                        all_predictions[_i] = {}
+                        all_predictions[_i]['id'] = _i
+                        all_predictions[_i]['predict'] = output[_b].tolist()
+                        #all_predictions[_i]['score'] = score[_b].tolist()
+
+                    if idx % 10 == 0:
+                        print('inference samples', idx)
 
     if args.rank == 0:
         pred_file = os.path.join(args.work_dir, args.output_file) 
@@ -406,15 +442,49 @@ if __name__ == '__main__':
         )
 
     lm_net = GPT2LMModel(config)
+
+    if args.lora_dim > 0:
+        # target_modules = ['encoder.*query', 'encoder.*key', 'encoder.*value', 'encoder.*dense']
+        # target_modules = ['attn', 'mlp']
+        target_modules = ['attn.c_attn', 'attn.c_proj', 'mlp.c_fc', 'mlp.c_proj', 'decoder']
+        peft_config = LoraConfig(task_type=TaskType.CAUSAL_LM,
+                                 inference_mode=False,
+                                 r=args.lora_dim,
+                                 lora_alpha=args.lora_alpha,
+                                 lora_dropout=args.lora_dropout,
+                                 target_modules=target_modules)
+        lm_net= get_peft_model(lm_net, peft_config)
+
+        lm_net.print_trainable_parameters()
+        print(lm_net)
+
+    # ----- added for sq1e -----
+    sqcfg = senqnn_config_init(args) # we added/parsed our args in sq_args
+    sqcfg['dropout_prob_lora'] = args.lora_dropout
+    sqcfg['mapping'][peft_Linear]={"from": peft_Linear, "to": QLoRALinear}
+
+    # prepare the model for quantization
+    Qmodel_prep(lm_net, valid_loader, sqcfg, 
+                save_fname=''.join((args.work_dir, '/model', '.hf4')))
+
+    print(f"trainable parameters:")
+    for name, param in lm_net.named_parameters():
+        if param.requires_grad :
+            print(f"{name}")
+    print(f"frozen parameters:")
+    for name, param in lm_net.named_parameters():
+        if not param.requires_grad :
+            print(f"{name}")
+
     if args.init_checkpoint is not None:
         print('loading model pretrained weight.')
         cp = torch.load(args.init_checkpoint, map_location=torch.device('cpu'))
         # lm_net.load_weight(cp)    
-        lm_net.load_state_dict(cp['model_state_dict'], strict=False)
+        lm_net.load_state_dict(cp['model_state_dict'])
     lm_net = lm_net.cuda()
 
     print('model sampling ...')
-    beam(lm_net, valid_loader, args)
+    beam(lm_net, valid_loader, args, sqcfg)
     # distributed_sync(args)
     print('cleanup dist ...')
     cleanup(args)
