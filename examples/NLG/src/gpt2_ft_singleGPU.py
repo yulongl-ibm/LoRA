@@ -139,6 +139,10 @@ parser.add_argument('--dropout_prob_attn', type=float, default=0.1, help='in hf3
 parser.add_argument('--dropout_prob_hid', type=float, default=0.1, help='in hf3 we changed all dropout prob to 0.165')
 parser.add_argument('--dropout_prob_emb', type=float, default=0.1, help='in hf3 we changed all dropout prob to 0.165')
 parser.add_argument('--plotSVG',  action='store_true', help='save computation graphs, needs graphviz/pygraphviz')
+parser.add_argument('--teacher_model', type=str, default='', help='teacher model to run distillation during QAT') 
+parser.add_argument('--kd_ratio', type=float, default=1.0, help='loss ratio for knowledge distillation')
+parser.add_argument('--lora_initialization_checkpoint', type=str, default='', help='initialize lora weights from a may be higher precision checkpoint') 
+parser.add_argument('--resume_checkpoint', type=str, default='', help='resume checkpoint after qmodel prep') 
 
 # influence model, calculate the influence score between two samples.
 def print_args(args):
@@ -227,10 +231,14 @@ def train_validate(
     args,
     sqcfg,
     train_step=0, 
-    epoch=0
+    epoch=0,
+    teacher_model=None,
+    kd_ratio=1,
+
 ):
     model.train()
     avg_lm_loss = AverageMeter()
+    avg_kd_loss = AverageMeter()
     print('start to train the model................', epoch)
     log_start_time = time.time()
     best_val_ppl = None
@@ -248,18 +256,35 @@ def train_validate(
             # _lm_logits, _lm_loss = model(
             #     _input, lm_labels=_target, lm_mask=_msk, label_smooth=args.label_smooth
             # ) 
-            _lm_logits, _lm_loss = model(
+            _lm_logits, _lm_loss, hidden_states = model(
                 input_ids=_input, lm_labels=_target, lm_mask=_msk, label_smooth=args.label_smooth
             ) 
 
             _lm_loss = _lm_loss.mean() 
 
+            if teacher_model:
+                _lm_logits_teacher, _lm_loss_teacher, hidden_states_teacher = teacher_model(
+                    input_ids=_input, lm_labels=_target, lm_mask=_msk, label_smooth=args.label_smooth
+                )
+                loss_func = nn.MSELoss()
+                input_st = torch.stack(hidden_states)
+                input_te = torch.stack(hidden_states_teacher)
+                loss_kd = loss_func(input_st, input_te)
+                loss_total = _lm_loss + loss_kd * kd_ratio
+                avg_kd_loss.update(loss_kd.item())
+            else:
+                avg_kd_loss.update(0)
             train_step += 1
             is_update = True if train_step % args.grad_acc == 0 else False
             avg_lm_loss.update(_lm_loss.item())
-            optimizer_step(
-                _lm_loss/(args.grad_acc), optimizer, model, scheduler, args, is_update=is_update
-            )
+            if teacher_model:
+                optimizer_step(
+                    loss_total/(args.grad_acc), optimizer, model, scheduler, args, is_update=is_update
+                )
+            else:
+                optimizer_step(
+                    _lm_loss/(args.grad_acc), optimizer, model, scheduler, args, is_update=is_update
+                )
             
             if train_step % args.log_interval == 0: 
                 elapsed = time.time() - log_start_time
@@ -267,25 +292,31 @@ def train_validate(
                 log_str = f'| epoch {epoch:3d} step {train_step:>8d} | { idx + 1:>6d} batches | ' \
                         f'lr {lr:.3g} | ms/batch {elapsed * 1000 / args.log_interval:5.2f} | ' \
                         f'loss {avg_lm_loss.val:5.2f} | avg loss {avg_lm_loss.avg:5.2f} | ' \
+                        f'kd_loss {avg_kd_loss.val:5.2f} | avg kd loss {avg_kd_loss.avg:5.2f} | ' \
                         f'ppl {math.exp(avg_lm_loss.avg):5.2f}'
 
                 for k, v in model.named_parameters():
                     if 'clip_val' in k: tb_writer.add_scalar(k, v, train_step)
                 tb_writer.add_scalar("training loss", avg_lm_loss.val, train_step)
                 tb_writer.add_scalar("avg training loss", avg_lm_loss.avg, train_step)
+                tb_writer.add_scalar("training kd loss", avg_kd_loss.val, train_step)
+                tb_writer.add_scalar("avg training kd loss", avg_kd_loss.avg, train_step)
                 tb_writer.add_scalar("ppl", math.exp(avg_lm_loss.avg), train_step)
 
                 if args.rank == 0: 
                     print(log_str)
                 log_start_time = time.time()
                 avg_lm_loss.reset()
+                avg_kd_loss.reset()
             
             if train_step % args.save_interval == 0: 
                 if args.rank == 0:
                     model_path = os.path.join(args.work_dir, f'model.{train_step}.pt')
                     print('saving checkpoint', model_path)
                     # torch.save({'model_state_dict': lora.lora_state_dict(model)}, model_path)
-                    torch.save({'model_state_dict': model.state_dict()}, model_path) 
+                    torch.save({'model_state_dict': model.state_dict(),
+                                'optimizer_state_dict': optimizer.state_dict(),
+                                'lr_scheduler_state_dict': scheduler.state_dict()}, model_path) 
                 # distributed_sync(args)
 
             # evaluation interval
@@ -388,11 +419,21 @@ if __name__ == '__main__':
         )
 
     lm_net = GPT2LMModel(config)
+    if args.teacher_model:
+        lm_net_teacher = GPT2LMModel(config)
+        checkpoint = torch.load(args.teacher_model)
+        lm_net_teacher.load_state_dict(checkpoint['model_state_dict'])
+        lm_net_teacher.eval()
+    else:
+        lm_net_teacher = None
+
+
     if args.init_checkpoint is not None:
         print('loading model pretrained weight.')
         lm_net.load_weight(torch.load(args.init_checkpoint))    
 
     lm_net = lm_net.cuda()
+    lm_net_teacher = lm_net_teacher.cuda()
 
     # if args.lora_dim > 0:
     #     lora.mark_only_lora_as_trainable(lm_net)
@@ -441,6 +482,20 @@ if __name__ == '__main__':
                     optimizer=optimizer, scheduler=scheduler,
                     save_fname=''.join((args.work_dir, '/model', '.hf4')))
 
+    if args.lora_initialization_checkpoint:
+        lora_initialization_checkpoint = torch.load(args.lora_initialization_checkpoint)
+        lora_state_dict = {k: v for k, v in lora_initialization_checkpoint['model_state_dict'].items() if 'lora' in k}
+        for name, param in lm_net.named_parameters():
+            if name in lora_state_dict.keys():
+                print(f'loading lora weights: {name}')
+        lm_net.load_state_dict(lora_state_dict, strict=False)
+    
+    if args.resume_checkpoint:
+        checkpoint = torch.load(args.resume_checkpoint)
+        lm_net.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        scheduler.load_state_dict(checkpoint['lr_scheduler_state_dict'])
+
     print(f"trainable parameters:")
     for name, param in lm_net.named_parameters():
         if param.requires_grad :
@@ -455,7 +510,7 @@ if __name__ == '__main__':
         for epoch in itertools.count(start=1):
             train_step = train_validate(
                 lm_net, optimizer, scheduler, train_loader, valid_loader, args, sqcfg,
-                train_step=train_step, epoch=epoch
+                train_step=train_step, epoch=epoch, teacher_model=lm_net_teacher, kd_ratio=args.kd_ratio
             )
             
             if train_step >= args.max_step or (args.max_epoch is not None and epoch >= args.max_epoch):

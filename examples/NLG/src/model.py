@@ -418,10 +418,10 @@ class GPT2LMModel(nn.Module):
             loss = loss.sum() / (lm_mask.sum() + 0.0001)
 
             if is_report_accuracy:
-                return lm_logits, loss, _t1_acc, _all_acc
+                return lm_logits, loss, _t1_acc, _all_acc, hidden_states
             else:
-                return lm_logits, loss
-        return lm_logits, presents
+                return lm_logits, loss, hidden_states
+        return lm_logits, presents, hidden_states
            
     def _init_weights(self, module):
         if isinstance(module, (nn.Linear, nn.Embedding)):
