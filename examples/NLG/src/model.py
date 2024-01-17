@@ -17,6 +17,7 @@ from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LambdaLR
 from torch.nn.parameter import Parameter
 import transformers
+import modeling_gpt2
 
 # import loralib as lora
 
@@ -336,7 +337,8 @@ class GPT2LMModel(nn.Module):
     def __init__(self, config):
         super(GPT2LMModel, self).__init__()
         # self.transformer = GPT2Model(config)
-        self.transformer = transformers.GPT2Model.from_pretrained('gpt2-medium')
+        # self.transformer = transformers.GPT2Model.from_pretrained('gpt2-medium')
+        self.transformer = modeling_gpt2.GPT2Model.from_pretrained('gpt2-medium')
         self.lm_head = GPT2LMHead(self.transformer.wte.weight, config)
         self.apply(self._init_weights)
         self.config = config
@@ -365,8 +367,9 @@ class GPT2LMModel(nn.Module):
         _batch, _len = input_ids.shape
         # hidden_states, presents = self.transformer(input_ids, past=past, len_past=len_past)
         # For HF gpt2
-        transformers_out = self.transformer(input_ids, past_key_values=past, position_ids=position_ids)
-        hidden_states, presents = transformers_out['last_hidden_state'], transformers_out['past_key_values']
+        transformers_out = self.transformer(input_ids, past_key_values=past, position_ids=position_ids, output_hidden_states=True)
+        # hidden_states, presents, all_hidden_states = transformers_out['last_hidden_state'], transformers_out['past_key_values'], transformers_out['hidden_states']
+        hidden_states, presents, all_hidden_states = transformers_out['last_hidden_state'], transformers_out['past_key_values'], transformers_out['all_hidden_states_ln_1']
 
         # batch, seq, vocab
         lm_logits = self.lm_head(hidden_states)
@@ -418,10 +421,10 @@ class GPT2LMModel(nn.Module):
             loss = loss.sum() / (lm_mask.sum() + 0.0001)
 
             if is_report_accuracy:
-                return lm_logits, loss, _t1_acc, _all_acc, hidden_states
+                return lm_logits, loss, _t1_acc, _all_acc, all_hidden_states
             else:
-                return lm_logits, loss, hidden_states
-        return lm_logits, presents, hidden_states
+                return lm_logits, loss, all_hidden_states
+        return lm_logits, presents, all_hidden_states
            
     def _init_weights(self, module):
         if isinstance(module, (nn.Linear, nn.Embedding)):

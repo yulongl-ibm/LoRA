@@ -40,6 +40,9 @@ from peft.tuners.lora.layer import Linear as peft_Linear
 from sq1e.sen_qnn_ext import Qmodel_prep, senqnn_config_init, patch_torch_bmm
 from sq1e.sen_qnn_infer import QLoRALinear
 
+import functools
+print = functools.partial(print, flush=True)
+
 parser = argparse.ArgumentParser(description='PyTorch GPT2 beam decoding')
 
 # add_gpu_params(parser)
@@ -313,7 +316,7 @@ def beam(model, data_iter, args, sqcfg):
                 with torch.no_grad():
                     for i in range(0, args.eval_len):
                         if i == 0:
-                            logits, past = model(_query) 
+                            logits, past, _ = model(_query) 
                             logits = logits[_bbatch, (_query_len-1).long(), :] # batch_size * beam, vocab
                         else:
                             #print('token_id.shape', token_id.shape, token_id)
@@ -321,7 +324,7 @@ def beam(model, data_iter, args, sqcfg):
                             #print('len_past.shape', len_past.shape, len_past)
                             
                             position_ids = (len_past).unsqueeze(1)
-                            logits, past = model(token_id, past=past, len_past=len_past, position_ids=position_ids) 
+                            logits, past, _ = model(token_id, past=past, len_past=len_past, position_ids=position_ids) 
 
                             logits = logits[:, -1, :]    # batch_size * beam, vocab
 

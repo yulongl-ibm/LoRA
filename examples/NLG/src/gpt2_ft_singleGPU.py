@@ -40,6 +40,11 @@ from sq1e.sen_qnn_ext import Qmodel_prep, senqnn_config_init, patch_torch_bmm
 from sq1e.sen_qnn_infer import QLoRALinear
 from torch.utils.tensorboard import SummaryWriter
 
+import functools
+
+print = functools.partial(print, flush=True)
+
+
 parser = argparse.ArgumentParser(description='PyTorch GPT2 ft script')
 # add_gpu_params(parser)
 add_optimizer_params(parser)
@@ -209,7 +214,7 @@ def evaluate(model, valid_loader, args):
             _target = data['target'].to(args.device)
             _msk = data['mask'].to(args.device)
 
-            _lm_logits, _loss = model(_input, lm_labels=_target, lm_mask=_msk) 
+            _lm_logits, _loss, _ = model(_input, lm_labels=_target, lm_mask=_msk) 
             loss = _loss.mean() 
             
             avg_lm_loss.update(loss.item())
@@ -263,13 +268,17 @@ def train_validate(
             _lm_loss = _lm_loss.mean() 
 
             if teacher_model:
-                _lm_logits_teacher, _lm_loss_teacher, hidden_states_teacher = teacher_model(
-                    input_ids=_input, lm_labels=_target, lm_mask=_msk, label_smooth=args.label_smooth
-                )
-                loss_func = nn.MSELoss()
-                input_st = torch.stack(hidden_states)
-                input_te = torch.stack(hidden_states_teacher)
-                loss_kd = loss_func(input_st, input_te)
+                with torch.no_grad():
+                    _lm_logits_teacher, _, hidden_states_teacher = teacher_model( input_ids=_input)
+                    # _lm_logits, _lm_loss_teacher, hidden_states_teacher = teacher_model( input_ids=_input, lm_labels=_target, lm_mask=_msk, label_smooth=args.label_smooth) 
+                output_st = torch.stack(hidden_states)
+                output_te = torch.stack(hidden_states_teacher)
+
+                loss_func = torch.nn.MSELoss()
+                # loss_func = torch.nn.L1Loss()
+                loss_kd = loss_func(output_st, output_te)
+
+
                 loss_total = _lm_loss + loss_kd * kd_ratio
                 avg_kd_loss.update(loss_kd.item())
             else:
@@ -349,7 +358,9 @@ def train_validate(
     if args.rank == 0:
         model_path = os.path.join(args.work_dir, f'model.{train_step}.pt')
         print('saving checkpoint', model_path)
-        torch.save({'model_state_dict': model.state_dict()}, model_path) 
+        torch.save({'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'lr_scheduler_state_dict': scheduler.state_dict()}, model_path) 
     # distributed_sync(args)
     return train_step
 
@@ -433,7 +444,7 @@ if __name__ == '__main__':
         lm_net.load_weight(torch.load(args.init_checkpoint))    
 
     lm_net = lm_net.cuda()
-    lm_net_teacher = lm_net_teacher.cuda()
+    if lm_net_teacher: lm_net_teacher = lm_net_teacher.cuda()
 
     # if args.lora_dim > 0:
     #     lora.mark_only_lora_as_trainable(lm_net)
